@@ -18,7 +18,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def translate_to_english(text: str) -> str:
     try:
         result = GoogleTranslator(source="auto", target="en").translate(text)
-        return result if result else text
+        result = result if result else text
+
+        # If result unchanged and text has non-ASCII, force traditional Chinese
+        if result == text and not text.isascii():
+            result = GoogleTranslator(source="zh-TW", target="en").translate(text)
+            result = result if result else text
+
+        return result
     except Exception as e:
         print(f"Translation error: {e}")
         return text
