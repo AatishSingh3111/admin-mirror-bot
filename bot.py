@@ -4,10 +4,9 @@ from discord.ext import commands
 from langdetect import detect, LangDetectException
 from deep_translator import GoogleTranslator
 
-# ---- Config (set these as environment variables on Railway) ----
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-SOURCE_CHANNEL_ID = int(os.environ["SOURCE_CHANNEL_ID"])   # the #admin channel
-MIRROR_CHANNEL_ID = int(os.environ["MIRROR_CHANNEL_ID"])   # the new translated channel
+SOURCE_CHANNEL_ID = int(os.environ["SOURCE_CHANNEL_ID"])
+MIRROR_CHANNEL_ID = int(os.environ["MIRROR_CHANNEL_ID"])
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -15,13 +14,15 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Cache the webhook so we don't re-fetch it on every message
+_webhook_cache: discord.Webhook | None = None
+
 
 def is_english(text: str) -> bool:
-    """Returns True if text is detected as English (or can't be detected, e.g. emoji-only)."""
     try:
         return detect(text) == "en"
     except LangDetectException:
-        return True
+        return True  # emoji-only / undetectable → treat as English
 
 
 def translate_to_english(text: str) -> str:
@@ -31,52 +32,61 @@ def translate_to_english(text: str) -> str:
         return f"[translation failed: {e}]"
 
 
+async def get_mirror_webhook() -> discord.Webhook | None:
+    global _webhook_cache
+    if _webhook_cache:
+        return _webhook_cache
+
+    mirror_channel = bot.get_channel(MIRROR_CHANNEL_ID)
+    if not isinstance(mirror_channel, discord.TextChannel):
+        return None
+
+    # Reuse an existing webhook named "MirrorBot" or create one
+    webhooks = await mirror_channel.webhooks()
+    hook = next((w for w in webhooks if w.name == "MirrorBot"), None)
+    if hook is None:
+        hook = await mirror_channel.create_webhook(name="MirrorBot")
+
+    _webhook_cache = hook
+    return hook
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
-    print(f"Watching channel {SOURCE_CHANNEL_ID} -> mirroring to {MIRROR_CHANNEL_ID}")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore the bot's own messages and other bots
     if message.author.bot:
         return
-
-    # Only act on messages from the source (admin) channel
     if message.channel.id != SOURCE_CHANNEL_ID:
         return
 
-    mirror_channel = bot.get_channel(MIRROR_CHANNEL_ID)
-    if mirror_channel is None:
-        print(f"Could not find mirror channel {MIRROR_CHANNEL_ID}")
+    hook = await get_mirror_webhook()
+    if hook is None:
+        print("Could not get mirror webhook")
         return
 
-    embed = discord.Embed(color=discord.Color.blurple())
-    embed.set_author(
-        name=message.author.display_name,
-        icon_url=message.author.display_avatar.url,
-    )
-
+    # Translate content if non-English
     content = message.content
-    if content:
-        if is_english(content):
-            embed.description = content
-        else:
-            embed.description = translate_to_english(content)
+    if content and not is_english(content):
+        content = translate_to_english(content)
 
-    # Mirror any attachments (images, files, etc.)
-    if message.attachments:
-        urls = "\n".join(a.url for a in message.attachments)
-        embed.add_field(name="Attachments", value=urls, inline=False)
-        first = message.attachments[0]
-        if first.content_type and first.content_type.startswith("image"):
-            embed.set_image(url=first.url)
+    # Collect attachment files to re-upload (so they appear inline, not as links)
+    files = []
+    for attachment in message.attachments:
+        try:
+            files.append(await attachment.to_file())
+        except Exception as e:
+            print(f"Could not fetch attachment: {e}")
 
-    embed.set_footer(text=f"from #{message.channel.name}")
-    embed.timestamp = message.created_at
-
-    await mirror_channel.send(embed=embed)
+    await hook.send(
+        content=content or None,
+        username=message.author.display_name,
+        avatar_url=message.author.display_avatar.url,
+        files=files,
+    )
 
     await bot.process_commands(message)
 
