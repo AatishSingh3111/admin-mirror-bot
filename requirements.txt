@@ -1,5 +1,5 @@
 discord.py==2.6.0
 langdetect==1.0.9
 deep-translator==1.11.4
-dodopayments>=1.0.0
+dodopayments[webhooks]
 aiohttp>=3.9
