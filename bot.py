@@ -1,13 +1,70 @@
 import os
-import discord
-from discord.ext import commands
-import aiohttp
-from deep_translator import GoogleTranslator
+import json
+import asyncio
+import logging
+from pathlib import Path
 
+import discord
+from discord.ext import commands, tasks
+import aiohttp
+from aiohttp import web
+from deep_translator import GoogleTranslator
+from dodopayments import AsyncDodoPayments
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 SOURCE_CHANNEL_ID = int(os.environ["SOURCE_CHANNEL_ID"])
 MIRROR_WEBHOOK_URL = os.environ["MIRROR_WEBHOOK_URL"]
+SPANISH_MIRROR_WEBHOOK_URL = os.environ.get("SPANISH_MIRROR_WEBHOOK_URL")
 
+GUILD_ID = int(os.environ["GUILD_ID"])
+ADMIN_USER_IDS = {
+    int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()
+}
+
+DODO_API_KEY = os.environ["DODO_PAYMENTS_API_KEY"]
+DODO_WEBHOOK_SECRET = os.environ["DODO_PAYMENTS_WEBHOOK_SECRET"]
+DODO_ENVIRONMENT = os.environ.get("DODO_PAYMENTS_ENVIRONMENT", "live_mode")
+DODO_PRODUCT_ID = os.environ["DODO_PRODUCT_ID"]
+DODO_RETURN_URL = os.environ.get("DODO_RETURN_URL", "https://discord.com/channels/@me")
+
+PORT = int(os.environ.get("PORT", 8080))
+STATE_FILE = Path("subscription_state.json")
+
+dodo = AsyncDodoPayments(
+    bearer_token=DODO_API_KEY,
+    webhook_key=DODO_WEBHOOK_SECRET,
+    environment=DODO_ENVIRONMENT,
+)
+
+# ---------------------------------------------------------------------------
+# Subscription state (file-backed so a restart doesn't lose it; note this
+# resets on a fresh Railway deploy unless you attach a persistent Volume —
+# the hourly reconcile loop below re-syncs from Dodo either way)
+# ---------------------------------------------------------------------------
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"active": False, "subscription_id": None, "customer_id": None}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state))
+
+
+state = load_state()
+
+# ---------------------------------------------------------------------------
+# Discord bot
+# ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -15,25 +72,50 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def translate_to_english(text: str) -> str:
+def translate_text(text: str, target: str) -> str:
     try:
-        result = GoogleTranslator(source="auto", target="en").translate(text)
+        result = GoogleTranslator(source="auto", target=target).translate(text)
         result = result if result else text
-
-        # If result unchanged and text has non-ASCII, force traditional Chinese
         if result == text and not text.isascii():
-            result = GoogleTranslator(source="zh-TW", target="en").translate(text)
+            result = GoogleTranslator(source="zh-TW", target=target).translate(text)
             result = result if result else text
-
         return result
     except Exception as e:
-        print(f"Translation error: {e}")
+        log.warning(f"Translation error ({target}): {e}")
         return text
+
+
+async def mirror_message(message: discord.Message, webhook_url: str, target_lang: str):
+    content = message.content
+    if content:
+        content = translate_text(content, target_lang)
+
+    files = []
+    for attachment in message.attachments:
+        try:
+            files.append(await attachment.to_file())
+        except Exception as e:
+            log.warning(f"Could not fetch attachment: {e}")
+
+    async with aiohttp.ClientSession() as session:
+        hook = discord.Webhook.from_url(webhook_url, session=session)
+        await hook.send(
+            content=content or None,
+            username=message.author.display_name,
+            avatar_url=message.author.display_avatar.url,
+            files=files,
+        )
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (id: {bot.user.id})")
+    log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
+    guild_obj = discord.Object(id=GUILD_ID)
+    bot.tree.copy_global_to(guild=guild_obj)
+    synced = await bot.tree.sync(guild=guild_obj)
+    log.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
+    if not reconcile_subscription.is_running():
+        reconcile_subscription.start()
 
 
 @bot.event
@@ -43,27 +125,164 @@ async def on_message(message: discord.Message):
     if message.channel.id != SOURCE_CHANNEL_ID:
         return
 
-    content = message.content
-    if content:
-        content = translate_to_english(content)
-
-    files = []
-    for attachment in message.attachments:
-        try:
-            files.append(await attachment.to_file())
-        except Exception as e:
-            print(f"Could not fetch attachment: {e}")
-
-    async with aiohttp.ClientSession() as session:
-        hook = discord.Webhook.from_url(MIRROR_WEBHOOK_URL, session=session)
-        await hook.send(
-            content=content or None,
-            username=message.author.display_name,
-            avatar_url=message.author.display_avatar.url,
-            files=files,
-        )
+    if state.get("active"):
+        await mirror_message(message, MIRROR_WEBHOOK_URL, "en")
+        if SPANISH_MIRROR_WEBHOOK_URL:
+            await mirror_message(message, SPANISH_MIRROR_WEBHOOK_URL, "es")
+    # else: subscription inactive -> intentionally does not mirror anything
 
     await bot.process_commands(message)
+
+
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+def is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.id in ADMIN_USER_IDS:
+        return True
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+
+@bot.tree.command(name="subscribe", description="Get a payment link to activate translation")
+async def subscribe(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "Only server admins can do this.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        session = await dodo.checkout_sessions.create(
+            product_cart=[{"product_id": DODO_PRODUCT_ID, "quantity": 1}],
+            return_url=DODO_RETURN_URL,
+            metadata={
+                "discord_user_id": str(interaction.user.id),
+                "discord_guild_id": str(interaction.guild_id),
+            },
+        )
+        url = getattr(session, "checkout_url", None) or getattr(session, "url", None)
+        await interaction.followup.send(
+            f"Here's your payment link — once it's paid, translation switches on "
+            f"automatically within a few seconds:\n{url}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        log.error(f"Checkout session creation failed: {e}")
+        await interaction.followup.send(
+            "Something went wrong creating the payment link. Check the bot logs.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="subscription_status", description="Check whether translation is currently active")
+async def subscription_status(interaction: discord.Interaction):
+    active = state.get("active", False)
+    msg = (
+        "✅ Translation is **active**."
+        if active
+        else "❌ Translation is **inactive** — run `/subscribe` to activate it."
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation: self-heals if a webhook was ever missed
+# ---------------------------------------------------------------------------
+@tasks.loop(hours=1)
+async def reconcile_subscription():
+    sub_id = state.get("subscription_id")
+    if not sub_id:
+        return
+    try:
+        sub = await dodo.subscriptions.retrieve(sub_id)
+        status = getattr(sub, "status", None)
+        active = status == "active"
+        if active != state.get("active"):
+            state["active"] = active
+            save_state(state)
+            log.info(f"Reconciled subscription status from Dodo: active={active}")
+    except Exception as e:
+        log.warning(f"Subscription reconcile failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Webhook server (runs in the same process/event loop as the bot)
+# ---------------------------------------------------------------------------
+# NOTE: field names inside `data` (e.g. subscription_id vs id) are based on
+# Dodo's published examples. Use Dodo Dashboard -> Webhooks -> "send test
+# event" and check the Railway logs after a real event to confirm the exact
+# shape, then adjust the lookups below if needed.
+ACTIVATING_EVENTS = {"subscription.active", "subscription.renewed"}
+DEACTIVATING_EVENTS = {
+    "subscription.cancelled",
+    "subscription.expired",
+    "subscription.failed",
+    "subscription.on_hold",
+}
+
+
+async def handle_dodo_webhook(request: web.Request) -> web.Response:
+    body = await request.read()
+    headers = {
+        "webhook-id": request.headers.get("webhook-id", ""),
+        "webhook-signature": request.headers.get("webhook-signature", ""),
+        "webhook-timestamp": request.headers.get("webhook-timestamp", ""),
+    }
+
+    try:
+        event = await dodo.webhooks.unwrap(body, headers=headers)
+    except Exception as e:
+        log.warning(f"Webhook signature verification failed: {e}")
+        return web.json_response({"error": "invalid signature"}, status=401)
+
+    event_dict = event.model_dump() if hasattr(event, "model_dump") else dict(event)
+    event_type = event_dict.get("type")
+    data = event_dict.get("data") or {}
+    log.info(f"Received Dodo webhook: {event_type}")
+
+    if event_type in ACTIVATING_EVENTS:
+        state["active"] = True
+        sub_id = data.get("subscription_id") or data.get("id")
+        customer = data.get("customer") or {}
+        if sub_id:
+            state["subscription_id"] = sub_id
+        if customer.get("customer_id"):
+            state["customer_id"] = customer["customer_id"]
+        save_state(state)
+        log.info("Translation ACTIVATED")
+    elif event_type in DEACTIVATING_EVENTS:
+        state["active"] = False
+        save_state(state)
+        log.info("Translation DEACTIVATED")
+
+    return web.json_response({"received": True})
+
+
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def start_webserver():
+    app = web.Application()
+    app.router.add_post("/webhooks/dodo", handle_dodo_webhook)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"Webhook server listening on 0.0.0.0:{PORT}")
+
+
+async def main():
+    async with bot:
+        await start_webserver()
+        await bot.start(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 bot.run(DISCORD_TOKEN)
