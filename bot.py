@@ -232,7 +232,12 @@ async def handle_dodo_webhook(request: web.Request) -> web.Response:
     }
 
     try:
-        event = await dodo.webhooks.unwrap(body, headers=headers)
+        # NOTE: unwrap() is synchronous (pure HMAC verification + JSON parsing,
+        # no network I/O) even though it hangs off the async client, so it must
+        # NOT be awaited. Awaiting it throws "object <EventType> can't be used
+        # in 'await' expression", which looked like a signature failure but
+        # wasn't.
+        event = dodo.webhooks.unwrap(body, headers=headers)
     except Exception as e:
         log.warning(f"Webhook signature verification failed: {e}")
         return web.json_response({"error": "invalid signature"}, status=401)
@@ -283,6 +288,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-bot.run(DISCORD_TOKEN)
