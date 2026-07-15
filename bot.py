@@ -54,7 +54,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"active": False, "subscription_id": None, "customer_id": None}
+    return {"active": False, "subscription_id": None, "customer_id": None, "subscribed_by": None}
 
 
 def save_state(state: dict) -> None:
@@ -147,12 +147,6 @@ def is_admin(interaction: discord.Interaction) -> bool:
 
 @bot.tree.command(name="subscribe", description="Get a payment link to activate translation")
 async def subscribe(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "Only server admins can do this.", ephemeral=True
-        )
-        return
-
     await interaction.response.defer(ephemeral=True)
     try:
         session = await dodo.checkout_sessions.create(
@@ -195,16 +189,19 @@ async def subscription_status(interaction: discord.Interaction):
     app_commands.Choice(name="Immediately", value="now"),
 ])
 async def cancel_subscription(interaction: discord.Interaction, when: app_commands.Choice[str] = None):
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "Only server admins can do this.", ephemeral=True
-        )
-        return
-
     sub_id = state.get("subscription_id")
     if not sub_id:
         await interaction.response.send_message(
             "There's no subscription on record to cancel.", ephemeral=True
+        )
+        return
+
+    subscribed_by = state.get("subscribed_by")
+    is_subscriber = subscribed_by is not None and str(interaction.user.id) == subscribed_by
+    if not is_subscriber and not is_admin(interaction):
+        await interaction.response.send_message(
+            "Only the person who subscribed, or a server admin, can cancel this.",
+            ephemeral=True,
         )
         return
 
@@ -303,10 +300,15 @@ async def handle_dodo_webhook(request: web.Request) -> web.Response:
         state["active"] = True
         sub_id = data.get("subscription_id") or data.get("id")
         customer = data.get("customer") or {}
+        metadata = data.get("metadata") or {}
         if sub_id:
             state["subscription_id"] = sub_id
         if customer.get("customer_id"):
             state["customer_id"] = customer["customer_id"]
+        if metadata.get("discord_user_id"):
+            # Whoever's checkout activated this subscription is the one
+            # allowed to cancel it later (admins can still override).
+            state["subscribed_by"] = metadata["discord_user_id"]
         save_state(state)
         log.info("Translation ACTIVATED")
     elif event_type in DEACTIVATING_EVENTS:
