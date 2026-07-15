@@ -24,6 +24,9 @@ MIRROR_WEBHOOK_URL = os.environ["MIRROR_WEBHOOK_URL"]
 SPANISH_MIRROR_WEBHOOK_URL = os.environ.get("SPANISH_MIRROR_WEBHOOK_URL")
 
 GUILD_ID = int(os.environ["GUILD_ID"])
+ADMIN_USER_IDS = {
+    int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()
+}
 
 DODO_API_KEY = os.environ["DODO_PAYMENTS_API_KEY"]
 DODO_WEBHOOK_SECRET = os.environ["DODO_PAYMENTS_WEBHOOK_SECRET"]
@@ -41,36 +44,21 @@ dodo = AsyncDodoPayments(
 )
 
 # ---------------------------------------------------------------------------
-# Subscription state — per-user now, keyed by Discord user ID (as a string,
-# since JSON object keys are always strings). File-backed so a restart
-# doesn't lose it; note this resets on a fresh Railway deploy unless you
-# attach a persistent Volume — the hourly reconcile loop below re-syncs
-# every known subscriber from Dodo either way.
+# Subscription state (file-backed so a restart doesn't lose it; note this
+# resets on a fresh Railway deploy unless you attach a persistent Volume —
+# the hourly reconcile loop below re-syncs from Dodo either way)
 # ---------------------------------------------------------------------------
-DEFAULT_USER_ENTRY = {"active": False, "subscription_id": None, "customer_id": None}
-
-
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            loaded = json.loads(STATE_FILE.read_text())
-            if "users" in loaded:
-                return loaded
+            return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"users": {}}
+    return {"active": False, "subscription_id": None, "customer_id": None}
 
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state))
-
-
-def get_user_state(user_id: str) -> dict:
-    return state["users"].get(user_id, dict(DEFAULT_USER_ENTRY))
-
-
-def get_or_create_user_entry(user_id: str) -> dict:
-    return state["users"].setdefault(user_id, dict(DEFAULT_USER_ENTRY))
 
 
 state = load_state()
@@ -127,8 +115,8 @@ async def on_ready():
     bot.tree.copy_global_to(guild=guild_obj)
     synced = await bot.tree.sync(guild=guild_obj)
     log.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
-    if not reconcile_subscriptions.is_running():
-        reconcile_subscriptions.start()
+    if not reconcile_subscription.is_running():
+        reconcile_subscription.start()
 
 
 @bot.event
@@ -138,22 +126,33 @@ async def on_message(message: discord.Message):
     if message.channel.id != SOURCE_CHANNEL_ID:
         return
 
-    author_state = get_user_state(str(message.author.id))
-    if author_state.get("active"):
+    if state.get("active"):
         await mirror_message(message, MIRROR_WEBHOOK_URL, "en")
         if SPANISH_MIRROR_WEBHOOK_URL:
             await mirror_message(message, SPANISH_MIRROR_WEBHOOK_URL, "es")
-    # else: this author has no active subscription -> their messages
-    # intentionally are not mirrored
+    # else: subscription inactive -> intentionally does not mirror anything
 
     await bot.process_commands(message)
 
 
 # ---------------------------------------------------------------------------
-# Slash commands (all act on the calling user's own subscription)
+# Slash commands
 # ---------------------------------------------------------------------------
-@bot.tree.command(name="subscribe", description="Get a payment link to activate translation for your messages")
+def is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.id in ADMIN_USER_IDS:
+        return True
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+
+@bot.tree.command(name="subscribe", description="Get a payment link to activate translation")
 async def subscribe(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "Only server admins can do this.", ephemeral=True
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
     try:
         session = await dodo.checkout_sessions.create(
@@ -167,7 +166,7 @@ async def subscribe(interaction: discord.Interaction):
         url = getattr(session, "checkout_url", None) or getattr(session, "url", None)
         await interaction.followup.send(
             f"Here's your payment link — once it's paid, translation switches on "
-            f"for your messages automatically within a few seconds:\n{url}",
+            f"automatically within a few seconds:\n{url}",
             ephemeral=True,
         )
     except Exception as e:
@@ -178,31 +177,34 @@ async def subscribe(interaction: discord.Interaction):
         )
 
 
-@bot.tree.command(name="subscription_status", description="Check whether translation is active for your messages")
+@bot.tree.command(name="subscription_status", description="Check whether translation is currently active")
 async def subscription_status(interaction: discord.Interaction):
-    author_state = get_user_state(str(interaction.user.id))
-    active = author_state.get("active", False)
+    active = state.get("active", False)
     msg = (
-        "✅ Translation is **active** for your messages."
+        "✅ Translation is **active**."
         if active
-        else "❌ Translation is **inactive** for your messages — run `/subscribe` to activate it."
+        else "❌ Translation is **inactive** — run `/subscribe` to activate it."
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="cancel_subscription", description="Cancel your translation subscription")
+@bot.tree.command(name="cancel_subscription", description="Cancel the translation subscription")
 @app_commands.describe(when="Cancel right away, or let it run until the period you've already paid for ends")
 @app_commands.choices(when=[
     app_commands.Choice(name="At end of current billing period (recommended)", value="next_billing_date"),
     app_commands.Choice(name="Immediately", value="now"),
 ])
 async def cancel_subscription(interaction: discord.Interaction, when: app_commands.Choice[str] = None):
-    user_id = str(interaction.user.id)
-    author_state = get_user_state(user_id)
-    sub_id = author_state.get("subscription_id")
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "Only server admins can do this.", ephemeral=True
+        )
+        return
+
+    sub_id = state.get("subscription_id")
     if not sub_id:
         await interaction.response.send_message(
-            "You don't have a subscription on record to cancel.", ephemeral=True
+            "There's no subscription on record to cancel.", ephemeral=True
         )
         return
 
@@ -212,20 +214,20 @@ async def cancel_subscription(interaction: discord.Interaction, when: app_comman
     try:
         if mode == "now":
             # Cancels the mandate immediately; no further charges can occur.
-            # The webhook (subscription.cancelled) will flip this user's
-            # active flag to False once Dodo confirms it.
+            # The webhook (subscription.cancelled) will flip state["active"]
+            # to False once Dodo confirms it.
             await dodo.subscriptions.update(sub_id, status="cancelled")
             msg = (
-                "Your subscription is cancelled immediately. Translation for "
-                "your messages will switch off shortly once Dodo confirms it."
+                "Subscription cancelled immediately. Translation will switch "
+                "off shortly once Dodo confirms the cancellation."
             )
         else:
-            # Keeps this user's translation active until the period already
-            # paid for ends, then it auto-cancels and the subscription.cancelled
-            # webhook fires at that point.
+            # Keeps the subscription (and translation) active until the
+            # period already paid for ends, then it auto-cancels and the
+            # subscription.cancelled webhook fires at that point.
             await dodo.subscriptions.update(sub_id, cancel_at_next_billing_date=True)
             msg = (
-                "Your subscription is scheduled to cancel at the end of the "
+                "Subscription is scheduled to cancel at the end of the "
                 "current billing period. Translation stays active until then."
             )
         await interaction.followup.send(msg, ephemeral=True)
@@ -238,24 +240,23 @@ async def cancel_subscription(interaction: discord.Interaction, when: app_comman
 
 
 # ---------------------------------------------------------------------------
-# Reconciliation: self-heals if a webhook was ever missed, per subscriber
+# Reconciliation: self-heals if a webhook was ever missed
 # ---------------------------------------------------------------------------
 @tasks.loop(hours=1)
-async def reconcile_subscriptions():
-    for user_id, entry in list(state["users"].items()):
-        sub_id = entry.get("subscription_id")
-        if not sub_id:
-            continue
-        try:
-            sub = await dodo.subscriptions.retrieve(sub_id)
-            status = getattr(sub, "status", None)
-            active = status == "active"
-            if active != entry.get("active"):
-                entry["active"] = active
-                log.info(f"Reconciled subscription status from Dodo for user {user_id}: active={active}")
-        except Exception as e:
-            log.warning(f"Subscription reconcile failed for user {user_id}: {e}")
-    save_state(state)
+async def reconcile_subscription():
+    sub_id = state.get("subscription_id")
+    if not sub_id:
+        return
+    try:
+        sub = await dodo.subscriptions.retrieve(sub_id)
+        status = getattr(sub, "status", None)
+        active = status == "active"
+        if active != state.get("active"):
+            state["active"] = active
+            save_state(state)
+            log.info(f"Reconciled subscription status from Dodo: active={active}")
+    except Exception as e:
+        log.warning(f"Subscription reconcile failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -298,32 +299,20 @@ async def handle_dodo_webhook(request: web.Request) -> web.Response:
     data = event_dict.get("data") or {}
     log.info(f"Received Dodo webhook: {event_type}")
 
-    # Per-user routing: the discord_user_id was set as checkout metadata in
-    # /subscribe, and Dodo carries metadata through to the subscription and
-    # every subsequent webhook event for it.
-    metadata = data.get("metadata") or {}
-    discord_user_id = metadata.get("discord_user_id")
-
-    if not discord_user_id:
-        log.warning(f"Webhook {event_type} had no discord_user_id in metadata; ignoring")
-        return web.json_response({"received": True})
-
-    entry = get_or_create_user_entry(discord_user_id)
-    sub_id = data.get("subscription_id") or data.get("id")
-    customer = data.get("customer") or {}
-
     if event_type in ACTIVATING_EVENTS:
-        entry["active"] = True
+        state["active"] = True
+        sub_id = data.get("subscription_id") or data.get("id")
+        customer = data.get("customer") or {}
         if sub_id:
-            entry["subscription_id"] = sub_id
+            state["subscription_id"] = sub_id
         if customer.get("customer_id"):
-            entry["customer_id"] = customer["customer_id"]
+            state["customer_id"] = customer["customer_id"]
         save_state(state)
-        log.info(f"Translation ACTIVATED for user {discord_user_id}")
+        log.info("Translation ACTIVATED")
     elif event_type in DEACTIVATING_EVENTS:
-        entry["active"] = False
+        state["active"] = False
         save_state(state)
-        log.info(f"Translation DEACTIVATED for user {discord_user_id}")
+        log.info("Translation DEACTIVATED")
 
     return web.json_response({"received": True})
 
