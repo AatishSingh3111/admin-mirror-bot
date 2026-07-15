@@ -35,7 +35,7 @@ DODO_PRODUCT_ID = os.environ["DODO_PRODUCT_ID"]
 DODO_RETURN_URL = os.environ.get("DODO_RETURN_URL", "https://discord.com/channels/@me")
 
 PORT = int(os.environ.get("PORT", 8080))
-STATE_FILE = Path("subscription_state.json")
+STATE_FILE = Path(os.environ.get("STATE_FILE_PATH", "subscription_state.json"))
 
 dodo = AsyncDodoPayments(
     bearer_token=DODO_API_KEY,
@@ -115,8 +115,64 @@ async def on_ready():
     bot.tree.copy_global_to(guild=guild_obj)
     synced = await bot.tree.sync(guild=guild_obj)
     log.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
+    await adopt_existing_subscription_if_any()
     if not reconcile_subscription.is_running():
         reconcile_subscription.start()
+
+
+async def adopt_existing_subscription_if_any():
+    # Startup safety net. If local state has no subscription_id on record —
+    # e.g. this is a fresh Volume, or a redeploy happened without one ever
+    # being attached — the reconcile loop below has nothing to check
+    # against, since it only re-verifies a subscription_id it already
+    # knows. This asks Dodo directly whether an active subscription for
+    # this product already exists and adopts it, so a paying user is never
+    # left stranded waiting for the next billing cycle's webhook.
+    if state.get("subscription_id"):
+        return
+
+    active_subs = []
+    try:
+        async for sub in dodo.subscriptions.list():
+            sub_dict = sub.model_dump() if hasattr(sub, "model_dump") else dict(sub)
+            if sub_dict.get("status") != "active":
+                continue
+            # If the SDK exposes product_id on the subscription, scope the
+            # adoption to this bot's product. If it doesn't, don't block on
+            # a field we're not sure exists.
+            product_id = sub_dict.get("product_id")
+            if product_id and product_id != DODO_PRODUCT_ID:
+                continue
+            active_subs.append(sub_dict)
+    except Exception as e:
+        log.warning(f"Startup subscription lookup failed: {e}")
+        return
+
+    if not active_subs:
+        log.info("No active Dodo subscription found on startup; nothing to adopt")
+        return
+
+    if len(active_subs) > 1:
+        active_subs.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+        log.warning(
+            f"Found {len(active_subs)} active Dodo subscriptions on startup; "
+            f"adopting the most recent one and ignoring the rest"
+        )
+
+    sub_dict = active_subs[0]
+    sub_id = sub_dict.get("subscription_id") or sub_dict.get("id")
+    customer = sub_dict.get("customer") or {}
+    metadata = sub_dict.get("metadata") or {}
+
+    state["active"] = True
+    if sub_id:
+        state["subscription_id"] = sub_id
+    if customer.get("customer_id"):
+        state["customer_id"] = customer["customer_id"]
+    if metadata.get("discord_user_id"):
+        state["subscribed_by"] = metadata["discord_user_id"]
+    save_state(state)
+    log.info(f"Adopted existing active subscription on startup: {sub_id}")
 
 
 @bot.event
@@ -342,3 +398,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
