@@ -9,7 +9,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
 from aiohttp import web
-from deep_translator import MicrosoftTranslator
 from dodopayments import AsyncDodoPayments
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +29,7 @@ ADMIN_USER_IDS = {
 
 AZURE_TRANSLATOR_KEY = os.environ["AZURE_TRANSLATOR_KEY"]
 AZURE_TRANSLATOR_REGION = os.environ["AZURE_TRANSLATOR_REGION"]
+AZURE_TRANSLATOR_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
 
 DODO_API_KEY = os.environ["DODO_PAYMENTS_API_KEY"]
 DODO_WEBHOOK_SECRET = os.environ["DODO_PAYMENTS_WEBHOOK_SECRET"]
@@ -77,21 +77,28 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def translate_text(text: str, target: str) -> str:
-    def _translate():
-        return MicrosoftTranslator(
-            source="auto",
-            target=target,
-            api_key=AZURE_TRANSLATOR_KEY,
-            region=AZURE_TRANSLATOR_REGION,
-        ).translate(text)
+    # Calling Azure's REST API directly rather than going through
+    # deep-translator's MicrosoftTranslator wrapper: that wrapper sends
+    # source="auto" through literally as from=auto, which Azure rejects
+    # (error 400035, "source language is not valid"). Azure's own
+    # convention for auto-detection is to omit the `from` param entirely,
+    # so we build the request ourselves to do that correctly.
+    url = f"{AZURE_TRANSLATOR_ENDPOINT}/translate"
+    params = {"api-version": "3.0", "to": target}
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_TRANSLATOR_KEY,
+        "Ocp-Apim-Subscription-Region": AZURE_TRANSLATOR_REGION,
+        "Content-Type": "application/json",
+    }
+    body = [{"text": text}]
 
     try:
-        # MicrosoftTranslator does a blocking HTTP request under the hood.
-        # Running it directly in this coroutine would block the whole
-        # event loop (and starve the gateway heartbeat, causing constant
-        # RESUMEs) so push it to a thread.
-        result = await asyncio.to_thread(_translate)
-        return result if result else text
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, headers=headers, json=body) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"Azure Translator returned {resp.status}: {data}")
+                return data[0]["translations"][0]["text"]
     except Exception as e:
         log.warning(f"Translation error ({target}): {e}")
         return text
