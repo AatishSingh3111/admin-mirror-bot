@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import html
 import asyncio
 import logging
 from pathlib import Path
@@ -76,21 +78,37 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# Discord syntax that shouldn't be run through translation: user/role/channel
+# mentions, custom emoji, and URLs. Matched against the HTML-escaped text
+# (so e.g. <@123> becomes &lt;@123&gt; before matching) and wrapped in
+# <span class="notranslate">, which Azure guarantees to leave untouched when
+# textType=html. This is what keeps mentions and emoji from being corrupted
+# by translation, and stops the translator from trying to "translate" a URL.
+_PROTECT_RE = re.compile(
+    r"&lt;@!?\d+&gt;"       # user mentions
+    r"|&lt;@&amp;\d+&gt;"   # role mentions
+    r"|&lt;#\d+&gt;"        # channel mentions
+    r"|&lt;a?:\w+:\d+&gt;"  # custom/animated emoji
+    r"|https?://\S+"        # URLs
+)
+_SPAN_RE = re.compile(r'<span class="notranslate">(.*?)</span>', re.DOTALL)
+
+
 async def translate_text(text: str, target: str) -> str:
-    # Calling Azure's REST API directly rather than going through
-    # deep-translator's MicrosoftTranslator wrapper: that wrapper sends
-    # source="auto" through literally as from=auto, which Azure rejects
-    # (error 400035, "source language is not valid"). Azure's own
-    # convention for auto-detection is to omit the `from` param entirely,
-    # so we build the request ourselves to do that correctly.
+    # Escape the whole message first so nothing in it is misread as HTML,
+    # then wrap Discord-specific tokens in notranslate spans so Azure passes
+    # them through unchanged while translating the surrounding text.
+    escaped = html.escape(text, quote=False)
+    protected = _PROTECT_RE.sub(lambda m: f'<span class="notranslate">{m.group(0)}</span>', escaped)
+
     url = f"{AZURE_TRANSLATOR_ENDPOINT}/translate"
-    params = {"api-version": "3.0", "to": target}
+    params = {"api-version": "3.0", "to": target, "textType": "html"}
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_TRANSLATOR_KEY,
         "Ocp-Apim-Subscription-Region": AZURE_TRANSLATOR_REGION,
         "Content-Type": "application/json",
     }
-    body = [{"text": text}]
+    body = [{"text": protected}]
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -98,7 +116,11 @@ async def translate_text(text: str, target: str) -> str:
                 data = await resp.json()
                 if resp.status != 200:
                     raise RuntimeError(f"Azure Translator returned {resp.status}: {data}")
-                return data[0]["translations"][0]["text"]
+                translated_html = data[0]["translations"][0]["text"]
+                # Strip the notranslate wrapper tags, then unescape HTML
+                # entities back to plain characters for posting to Discord.
+                plain = _SPAN_RE.sub(lambda m: m.group(1), translated_html)
+                return html.unescape(plain)
     except Exception as e:
         log.warning(f"Translation error ({target}): {e}")
         return text
