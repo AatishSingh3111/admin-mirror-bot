@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
 from aiohttp import web
-from deep_translator import GoogleTranslator
+from deep_translator import MicrosoftTranslator
 from dodopayments import AsyncDodoPayments
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,9 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_USER_IDS = {
     int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()
 }
+
+AZURE_TRANSLATOR_KEY = os.environ["AZURE_TRANSLATOR_KEY"]
+AZURE_TRANSLATOR_REGION = os.environ["AZURE_TRANSLATOR_REGION"]
 
 DODO_API_KEY = os.environ["DODO_PAYMENTS_API_KEY"]
 DODO_WEBHOOK_SECRET = os.environ["DODO_PAYMENTS_WEBHOOK_SECRET"]
@@ -73,49 +76,22 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-# Google's web-translate scraper occasionally gets rate-limited/blocked and
-# returns a 200 OK error page instead of raising an exception. When that
-# happens deep-translator happily extracts text from the error page and
-# hands it back as if it were a real translation. Catch that here so we
-# fall back to the original text instead of mirroring garbage.
-_ERROR_PAGE_MARKERS = (
-    "that's an error",
-    "that’s an error",
-    "that's all we know",
-    "that’s all we know",
-    "error 500",
-    "error 404",
-    "server error",
-)
-
-
-def _looks_like_translator_error_page(result: str) -> bool:
-    if not result:
-        return True
-    lowered = result.lower()
-    return any(marker in lowered for marker in _ERROR_PAGE_MARKERS)
-
-
 async def translate_text(text: str, target: str) -> str:
-    def _translate(source: str):
-        return GoogleTranslator(source=source, target=target).translate(text)
+    def _translate():
+        return MicrosoftTranslator(
+            source="auto",
+            target=target,
+            api_key=AZURE_TRANSLATOR_KEY,
+            region=AZURE_TRANSLATOR_REGION,
+        ).translate(text)
 
     try:
-        # GoogleTranslator does a blocking HTTP request under the hood.
+        # MicrosoftTranslator does a blocking HTTP request under the hood.
         # Running it directly in this coroutine would block the whole
         # event loop (and starve the gateway heartbeat, causing constant
         # RESUMEs) so push it to a thread.
-        result = await asyncio.to_thread(_translate, "auto")
-        if _looks_like_translator_error_page(result):
-            raise ValueError(f"translator returned what looks like an error page: {result!r}")
-        result = result if result else text
-
-        if result == text and not text.isascii():
-            result2 = await asyncio.to_thread(_translate, "zh-TW")
-            if result2 and not _looks_like_translator_error_page(result2):
-                result = result2
-
-        return result
+        result = await asyncio.to_thread(_translate)
+        return result if result else text
     except Exception as e:
         log.warning(f"Translation error ({target}): {e}")
         return text
