@@ -73,13 +73,48 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def translate_text(text: str, target: str) -> str:
+# Google's web-translate scraper occasionally gets rate-limited/blocked and
+# returns a 200 OK error page instead of raising an exception. When that
+# happens deep-translator happily extracts text from the error page and
+# hands it back as if it were a real translation. Catch that here so we
+# fall back to the original text instead of mirroring garbage.
+_ERROR_PAGE_MARKERS = (
+    "that's an error",
+    "that’s an error",
+    "that's all we know",
+    "that’s all we know",
+    "error 500",
+    "error 404",
+    "server error",
+)
+
+
+def _looks_like_translator_error_page(result: str) -> bool:
+    if not result:
+        return True
+    lowered = result.lower()
+    return any(marker in lowered for marker in _ERROR_PAGE_MARKERS)
+
+
+async def translate_text(text: str, target: str) -> str:
+    def _translate(source: str):
+        return GoogleTranslator(source=source, target=target).translate(text)
+
     try:
-        result = GoogleTranslator(source="auto", target=target).translate(text)
+        # GoogleTranslator does a blocking HTTP request under the hood.
+        # Running it directly in this coroutine would block the whole
+        # event loop (and starve the gateway heartbeat, causing constant
+        # RESUMEs) so push it to a thread.
+        result = await asyncio.to_thread(_translate, "auto")
+        if _looks_like_translator_error_page(result):
+            raise ValueError(f"translator returned what looks like an error page: {result!r}")
         result = result if result else text
+
         if result == text and not text.isascii():
-            result = GoogleTranslator(source="zh-TW", target=target).translate(text)
-            result = result if result else text
+            result2 = await asyncio.to_thread(_translate, "zh-TW")
+            if result2 and not _looks_like_translator_error_page(result2):
+                result = result2
+
         return result
     except Exception as e:
         log.warning(f"Translation error ({target}): {e}")
@@ -89,7 +124,7 @@ def translate_text(text: str, target: str) -> str:
 async def mirror_message(message: discord.Message, webhook_url: str, target_lang: str):
     content = message.content
     if content:
-        content = translate_text(content, target_lang)
+        content = await translate_text(content, target_lang)
 
     files = []
     for attachment in message.attachments:
@@ -98,14 +133,31 @@ async def mirror_message(message: discord.Message, webhook_url: str, target_lang
         except Exception as e:
             log.warning(f"Could not fetch attachment: {e}")
 
+    if message.stickers:
+        # We don't fetch sticker images here, just preserve the name so the
+        # message isn't silently dropped when it's sticker-only.
+        sticker_note = "[sticker: " + ", ".join(s.name for s in message.stickers) + "]"
+        content = f"{content}\n{sticker_note}".strip() if content else sticker_note
+
+    if not content and not files:
+        # Nothing to send (e.g. a poll-closed system message, or some other
+        # message type with no content/attachments). Webhooks 400 on a
+        # truly empty send, so skip it instead of letting that crash
+        # on_message.
+        log.info(f"Skipping mirror of message {message.id}: nothing to send")
+        return
+
     async with aiohttp.ClientSession() as session:
         hook = discord.Webhook.from_url(webhook_url, session=session)
-        await hook.send(
-            content=content or None,
-            username=message.author.display_name,
-            avatar_url=message.author.display_avatar.url,
-            files=files,
-        )
+        try:
+            await hook.send(
+                content=content or None,
+                username=message.author.display_name,
+                avatar_url=message.author.display_avatar.url,
+                files=files,
+            )
+        except discord.HTTPException as e:
+            log.warning(f"Failed to mirror message {message.id} ({target_lang}): {e}")
 
 
 @bot.event
@@ -183,9 +235,16 @@ async def on_message(message: discord.Message):
         return
 
     if state.get("active"):
-        await mirror_message(message, MIRROR_WEBHOOK_URL, "en")
+        try:
+            await mirror_message(message, MIRROR_WEBHOOK_URL, "en")
+        except Exception as e:
+            log.error(f"Failed to mirror message {message.id} (en): {e}")
+
         if SPANISH_MIRROR_WEBHOOK_URL:
-            await mirror_message(message, SPANISH_MIRROR_WEBHOOK_URL, "es")
+            try:
+                await mirror_message(message, SPANISH_MIRROR_WEBHOOK_URL, "es")
+            except Exception as e:
+                log.error(f"Failed to mirror message {message.id} (es): {e}")
     # else: subscription inactive -> intentionally does not mirror anything
 
     await bot.process_commands(message)
@@ -398,4 +457,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
