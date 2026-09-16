@@ -127,6 +127,10 @@ async def translate_text(text: str, target: str) -> str:
 
 
 async def mirror_message(message: discord.Message, webhook_url: str, target_lang: str):
+    # NOTE: this used to swallow discord.HTTPException internally (log and
+    # return). It now lets that exception propagate so the queue worker
+    # below can tell a genuine 429 apart from other failures and retry it
+    # instead of silently dropping the message.
     content = message.content
     if content:
         content = await translate_text(content, target_lang)
@@ -154,15 +158,69 @@ async def mirror_message(message: discord.Message, webhook_url: str, target_lang
 
     async with aiohttp.ClientSession() as session:
         hook = discord.Webhook.from_url(webhook_url, session=session)
+        await hook.send(
+            content=content or None,
+            username=message.author.display_name,
+            avatar_url=message.author.display_avatar.url,
+            files=files,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mirror queue
+#
+# on_message no longer calls the webhooks directly. Posting several
+# messages back-to-back in the source channel used to fire off that many
+# webhook sends (EN + ES per message) all at once, which regularly tripped
+# Discord's per-webhook rate limit and, on busier bursts, its global rate
+# limit — and a rate-limited send was simply logged and dropped, so that
+# message never reached the mirror channels.
+#
+# Every message is now queued as one job per target language. A single
+# worker drains the queue and pauses MIRROR_MIN_INTERVAL between jobs, so
+# both webhooks combined stay well under Discord's limits even during a
+# burst. On a genuine 429 the job is re-queued with backoff (up to
+# MIRROR_MAX_ATTEMPTS) instead of being dropped.
+# ---------------------------------------------------------------------------
+MIRROR_MIN_INTERVAL = 1.0    # seconds to wait between consecutive webhook sends
+MIRROR_MAX_ATTEMPTS = 5      # give up on a job (and log it) after this many tries
+MIRROR_RETRY_BACKOFF = 5.0   # base seconds to wait before retrying a rate-limited job
+
+mirror_queue: asyncio.Queue = asyncio.Queue()
+_mirror_worker_task: asyncio.Task | None = None
+
+
+async def enqueue_mirror(message: discord.Message):
+    await mirror_queue.put((message, MIRROR_WEBHOOK_URL, "en", 1))
+    if SPANISH_MIRROR_WEBHOOK_URL:
+        await mirror_queue.put((message, SPANISH_MIRROR_WEBHOOK_URL, "es", 1))
+
+
+async def mirror_worker():
+    log.info("Mirror worker started")
+    while True:
+        message, webhook_url, target_lang, attempt = await mirror_queue.get()
         try:
-            await hook.send(
-                content=content or None,
-                username=message.author.display_name,
-                avatar_url=message.author.display_avatar.url,
-                files=files,
-            )
+            await mirror_message(message, webhook_url, target_lang)
         except discord.HTTPException as e:
-            log.warning(f"Failed to mirror message {message.id} ({target_lang}): {e}")
+            if e.status == 429 and attempt < MIRROR_MAX_ATTEMPTS:
+                delay = MIRROR_RETRY_BACKOFF * attempt
+                log.warning(
+                    f"Rate limited mirroring message {message.id} ({target_lang}), "
+                    f"attempt {attempt}/{MIRROR_MAX_ATTEMPTS} — retrying in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+                await mirror_queue.put((message, webhook_url, target_lang, attempt + 1))
+            else:
+                log.error(
+                    f"Giving up mirroring message {message.id} ({target_lang}) "
+                    f"after {attempt} attempt(s): {e}"
+                )
+        except Exception as e:
+            log.error(f"Failed to mirror message {message.id} ({target_lang}): {e}")
+        finally:
+            mirror_queue.task_done()
+            await asyncio.sleep(MIRROR_MIN_INTERVAL)
 
 
 @bot.event
@@ -175,6 +233,9 @@ async def on_ready():
     await adopt_existing_subscription_if_any()
     if not reconcile_subscription.is_running():
         reconcile_subscription.start()
+    global _mirror_worker_task
+    if _mirror_worker_task is None or _mirror_worker_task.done():
+        _mirror_worker_task = asyncio.create_task(mirror_worker())
 
 
 async def adopt_existing_subscription_if_any():
@@ -240,16 +301,7 @@ async def on_message(message: discord.Message):
         return
 
     if state.get("active"):
-        try:
-            await mirror_message(message, MIRROR_WEBHOOK_URL, "en")
-        except Exception as e:
-            log.error(f"Failed to mirror message {message.id} (en): {e}")
-
-        if SPANISH_MIRROR_WEBHOOK_URL:
-            try:
-                await mirror_message(message, SPANISH_MIRROR_WEBHOOK_URL, "es")
-            except Exception as e:
-                log.error(f"Failed to mirror message {message.id} (es): {e}")
+        await enqueue_mirror(message)
     # else: subscription inactive -> intentionally does not mirror anything
 
     await bot.process_commands(message)
