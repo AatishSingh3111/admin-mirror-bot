@@ -4,6 +4,9 @@ import re
 import html
 import asyncio
 import logging
+import signal
+from collections import OrderedDict
+from io import BytesIO
 from pathlib import Path
 
 import discord
@@ -47,6 +50,24 @@ dodo = AsyncDodoPayments(
     webhook_key=DODO_WEBHOOK_SECRET,
     environment=DODO_ENVIRONMENT,
 )
+
+# ---------------------------------------------------------------------------
+# Shared HTTP session
+#
+# Both Azure Translator calls and webhook sends used to open a brand new
+# aiohttp.ClientSession (-> new TCP connection + TLS handshake) for every
+# single call. Under a burst of messages that churn adds real latency and,
+# at high enough volume, risks exhausting connections. One shared, pooled
+# session fixes that — and gives every request an explicit timeout so a
+# single hung call can't stall the mirror queue indefinitely.
+# ---------------------------------------------------------------------------
+http_session: aiohttp.ClientSession | None = None  # created in main() before the bot connects
+
+
+def get_session() -> aiohttp.ClientSession:
+    assert http_session is not None, "http_session used before main() initialized it"
+    return http_session
+
 
 # ---------------------------------------------------------------------------
 # Subscription state (file-backed so a restart doesn't lose it; note this
@@ -93,6 +114,9 @@ _PROTECT_RE = re.compile(
 )
 _SPAN_RE = re.compile(r'<span class="notranslate">(.*?)</span>', re.DOTALL)
 
+TRANSLATE_MAX_ATTEMPTS = 3     # total tries (including the first) before falling back to untranslated text
+TRANSLATE_RETRY_BACKOFF = 1.5  # base seconds between retries, scaled by attempt number
+
 
 async def translate_text(text: str, target: str) -> str:
     # Escape the whole message first so nothing in it is misread as HTML,
@@ -110,43 +134,183 @@ async def translate_text(text: str, target: str) -> str:
     }
     body = [{"text": protected}]
 
-    try:
-        async with aiohttp.ClientSession() as session:
+    session = get_session()
+    last_error: object = None
+
+    for attempt in range(1, TRANSLATE_MAX_ATTEMPTS + 1):
+        try:
             async with session.post(url, params=params, headers=headers, json=body) as resp:
+                # Azure itself can get rate-limited or briefly flaky under
+                # load — both are transient, so retry instead of immediately
+                # falling back to untranslated text. Capped so one slow
+                # request can't stall the queue worker for long.
+                if resp.status == 429 or resp.status >= 500:
+                    last_error = f"HTTP {resp.status}"
+                    if attempt < TRANSLATE_MAX_ATTEMPTS:
+                        retry_after = resp.headers.get("Retry-After")
+                        delay = float(retry_after) if retry_after else TRANSLATE_RETRY_BACKOFF * attempt
+                        await asyncio.sleep(min(delay, 10.0))
+                        continue
+                    break
+
                 data = await resp.json()
                 if resp.status != 200:
                     raise RuntimeError(f"Azure Translator returned {resp.status}: {data}")
+
                 translated_html = data[0]["translations"][0]["text"]
                 # Strip the notranslate wrapper tags, then unescape HTML
                 # entities back to plain characters for posting to Discord.
                 plain = _SPAN_RE.sub(lambda m: m.group(1), translated_html)
                 return html.unescape(plain)
-    except Exception as e:
-        log.warning(f"Translation error ({target}): {e}")
-        return text
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            last_error = e
+            if attempt < TRANSLATE_MAX_ATTEMPTS:
+                await asyncio.sleep(TRANSLATE_RETRY_BACKOFF * attempt)
+                continue
+            break
+        except Exception as e:
+            last_error = e
+            break
+
+    log.warning(f"Translation error ({target}) after {TRANSLATE_MAX_ATTEMPTS} attempt(s): {last_error}")
+    return text
 
 
-async def mirror_message(message: discord.Message, webhook_url: str, target_lang: str):
-    # NOTE: this used to swallow discord.HTTPException internally (log and
-    # return). It now lets that exception propagate so the queue worker
-    # below can tell a genuine 429 apart from other failures and retry it
-    # instead of silently dropping the message.
+async def build_reply_line(message: discord.Message, target_lang: str) -> str | None:
+    # Discord replies carry no indication of what/whom they're replying to
+    # in message.content — that context lives in message.reference — so
+    # without this the mirror just showed the reply text floating with no
+    # link back to the message it was answering, unlike the native Discord
+    # UI which shows a small quoted preview above it.
+    ref = message.reference
+    if ref is None:
+        return None
+
+    resolved = ref.resolved
+    if resolved is None and ref.message_id:
+        try:
+            resolved = await message.channel.fetch_message(ref.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            resolved = None
+
+    if resolved is None or isinstance(resolved, discord.DeletedReferencedMessage):
+        return "↪️ *Replying to a message that's no longer available*"
+
+    ref_author = resolved.author.display_name
+    ref_content = resolved.content or ("[attachment]" if resolved.attachments else "")
+    if not ref_content:
+        return f"↪️ Replying to **{ref_author}**"
+
+    translated_ref = await translate_text(ref_content, target_lang)
+    snippet = translated_ref if len(translated_ref) <= 100 else translated_ref[:100] + "…"
+    return f"↪️ Replying to **{ref_author}**: {snippet}"
+
+
+async def fetch_message_assets(message: discord.Message) -> list[dict]:
+    # Downloaded once per source message (not once per target language), so
+    # mirroring to English *and* Spanish doesn't pull every attachment off
+    # Discord's CDN twice — that duplicate traffic was unnecessary load on
+    # every image/video-heavy burst.
+    snapshots = getattr(message, "message_snapshots", None) or []
+    all_attachments = list(message.attachments) + [
+        a for snapshot in snapshots for a in (getattr(snapshot, "attachments", None) or [])
+    ]
+    assets = []
+    for attachment in all_attachments:
+        try:
+            data = await attachment.read()
+            assets.append({
+                "filename": attachment.filename,
+                "data": data,
+                "spoiler": attachment.is_spoiler(),
+            })
+        except Exception as e:
+            log.warning(f"Could not fetch attachment {attachment.filename}: {e}")
+    return assets
+
+
+def build_files_from_assets(assets: list[dict]) -> list[discord.File]:
+    # Builds a fresh discord.File per send from already-downloaded bytes —
+    # discord.py consumes/closes a File object once it's sent, so the same
+    # File can't be reused across the EN and ES jobs, but the expensive
+    # part (the network fetch) only happens once.
+    files = []
+    for asset in assets:
+        try:
+            files.append(discord.File(
+                BytesIO(asset["data"]),
+                filename=asset["filename"],
+                spoiler=asset.get("spoiler", False),
+            ))
+        except Exception as e:
+            log.warning(f"Could not prepare file {asset.get('filename')}: {e}")
+    return files
+
+
+async def build_mirror_content(message: discord.Message, target_lang: str, assets: list[dict]):
+    # Shared by both the initial send and edit paths, so a forwarded message
+    # or an edited message get the exact same treatment either way.
+    parts = []
+
+    reply_line = await build_reply_line(message, target_lang)
+    if reply_line:
+        parts.append(reply_line)
+
     content = message.content
     if content:
-        content = await translate_text(content, target_lang)
+        parts.append(await translate_text(content, target_lang))
 
-    files = []
-    for attachment in message.attachments:
-        try:
-            files.append(await attachment.to_file())
-        except Exception as e:
-            log.warning(f"Could not fetch attachment: {e}")
+    # Forwarded messages: Discord stores the forwarded content as a
+    # "snapshot" (message.message_snapshots) rather than putting it in
+    # message.content — a pure forward has empty message.content, so
+    # without this it looked like an empty message and got skipped
+    # entirely (the "Skipping mirror of message ...: nothing to send" log
+    # line), which is why forwards weren't showing up in the mirror at all.
+    snapshots = getattr(message, "message_snapshots", None) or []
+    for snapshot in snapshots:
+        snapshot_content = getattr(snapshot, "content", "") or ""
+        if snapshot_content:
+            translated_snapshot = await translate_text(snapshot_content, target_lang)
+            parts.append(f"↪️ **Forwarded:**\n{translated_snapshot}")
 
-    if message.stickers:
+    content_out = "\n\n".join(part for part in parts if part)
+
+    all_stickers = list(message.stickers) + [
+        s for snapshot in snapshots for s in (getattr(snapshot, "stickers", None) or [])
+    ]
+    if all_stickers:
         # We don't fetch sticker images here, just preserve the name so the
         # message isn't silently dropped when it's sticker-only.
-        sticker_note = "[sticker: " + ", ".join(s.name for s in message.stickers) + "]"
-        content = f"{content}\n{sticker_note}".strip() if content else sticker_note
+        sticker_note = "[sticker: " + ", ".join(s.name for s in all_stickers) + "]"
+        content_out = f"{content_out}\n{sticker_note}".strip() if content_out else sticker_note
+
+    files = build_files_from_assets(assets)
+    return content_out, files
+
+
+# In-memory map of (source_message_id, target_lang) -> mirrored message id,
+# so an edit to an already-mirrored message can find and edit its mirrored
+# copy instead of either duplicating it or being silently ignored. This
+# resets on a restart — an edit to a message mirrored in a previous process
+# lifetime just falls back to sending a fresh copy (see mirror_message_edit)
+# rather than failing. Bounded so long uptimes don't grow this forever.
+_MIRROR_ID_CACHE_MAX = 5000
+mirrored_message_ids: "OrderedDict[tuple[int, str], int]" = OrderedDict()
+
+
+def _remember_mirrored(source_id: int, target_lang: str, mirrored_id: int):
+    key = (source_id, target_lang)
+    mirrored_message_ids[key] = mirrored_id
+    mirrored_message_ids.move_to_end(key)
+    while len(mirrored_message_ids) > _MIRROR_ID_CACHE_MAX:
+        mirrored_message_ids.popitem(last=False)
+
+
+async def mirror_message(message: discord.Message, webhook_url: str, target_lang: str, assets: list[dict]):
+    # NOTE: this lets discord.HTTPException propagate so the queue worker
+    # below can tell a genuine 429/5xx apart from other failures and retry
+    # it instead of silently dropping the message.
+    content, files = await build_mirror_content(message, target_lang, assets)
 
     if not content and not files:
         # Nothing to send (e.g. a poll-closed system message, or some other
@@ -156,70 +320,122 @@ async def mirror_message(message: discord.Message, webhook_url: str, target_lang
         log.info(f"Skipping mirror of message {message.id}: nothing to send")
         return
 
-    async with aiohttp.ClientSession() as session:
-        hook = discord.Webhook.from_url(webhook_url, session=session)
-        await hook.send(
-            content=content or None,
-            username=message.author.display_name,
-            avatar_url=message.author.display_avatar.url,
-            files=files,
-        )
+    hook = discord.Webhook.from_url(webhook_url, session=get_session())
+    sent = await hook.send(
+        content=content or None,
+        username=message.author.display_name,
+        avatar_url=message.author.display_avatar.url,
+        files=files,
+        wait=True,  # need the sent message back so edits can find it later
+    )
+    _remember_mirrored(message.id, target_lang, sent.id)
+
+
+async def mirror_message_edit(message: discord.Message, webhook_url: str, target_lang: str, assets: list[dict]):
+    mirrored_id = mirrored_message_ids.get((message.id, target_lang))
+    if mirrored_id is None:
+        # We have no record of mirroring the original (never mirrored it,
+        # it was skipped as empty, or the bot restarted since). Rather than
+        # drop the edit, mirror the edited version fresh.
+        await mirror_message(message, webhook_url, target_lang, assets)
+        return
+
+    content, files = await build_mirror_content(message, target_lang, assets)
+    if not content and not files:
+        return
+
+    hook = discord.Webhook.from_url(webhook_url, session=get_session())
+    await hook.edit_message(
+        mirrored_id,
+        content=content or None,
+        attachments=files,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Mirror queue
 #
-# on_message no longer calls the webhooks directly. Posting several
-# messages back-to-back in the source channel used to fire off that many
-# webhook sends (EN + ES per message) all at once, which regularly tripped
-# Discord's per-webhook rate limit and, on busier bursts, its global rate
-# limit — and a rate-limited send was simply logged and dropped, so that
-# message never reached the mirror channels.
+# on_message never calls the webhooks directly — that's what let a burst of
+# source-channel messages trip Discord's per-webhook rate limit in the first
+# place. Instead:
 #
-# Every message is now queued as one job per target language. A single
-# worker drains the queue and pauses MIRROR_MIN_INTERVAL between jobs, so
-# both webhooks combined stay well under Discord's limits even during a
-# burst. On a genuine 429 the job is re-queued with backoff (up to
-# MIRROR_MAX_ATTEMPTS) instead of being dropped.
+#  - Attachments are downloaded once per source message (fetch_message_assets),
+#    not once per target language.
+#  - Each target language gets its OWN queue and its OWN worker, so English
+#    and Spanish mirroring proceed in parallel instead of taking turns on a
+#    single shared "one message per second" budget.
+#  - Each worker only sends to its own webhook, MIRROR_MIN_INTERVAL apart,
+#    which stays well under Discord's per-webhook rate limit even with both
+#    workers running at once.
+#  - A genuine 429/5xx re-queues the job with backoff (up to
+#    MIRROR_MAX_ATTEMPTS) instead of dropping the message. A backlog past
+#    _QUEUE_WARN_THRESHOLD gets logged so a stuck webhook / bad translator
+#    key shows up immediately instead of silently piling up.
 # ---------------------------------------------------------------------------
-MIRROR_MIN_INTERVAL = 1.0    # seconds to wait between consecutive webhook sends
-MIRROR_MAX_ATTEMPTS = 5      # give up on a job (and log it) after this many tries
-MIRROR_RETRY_BACKOFF = 5.0   # base seconds to wait before retrying a rate-limited job
+MIRROR_MIN_INTERVAL = 1.0      # seconds to wait between consecutive sends on one worker
+MIRROR_MAX_ATTEMPTS = 5        # give up on a job (and log it) after this many tries
+MIRROR_RETRY_BACKOFF = 5.0     # base seconds to wait before retrying a rate-limited/failed job
+_QUEUE_WARN_THRESHOLD = 30     # log a warning if a queue backs up past this many pending jobs
 
-mirror_queue: asyncio.Queue = asyncio.Queue()
-_mirror_worker_task: asyncio.Task | None = None
+mirror_queues: dict[str, asyncio.Queue] = {}
+_mirror_worker_tasks: list[asyncio.Task] = []
+
+
+def _mirror_targets() -> list[tuple[str, str]]:
+    targets = [("en", MIRROR_WEBHOOK_URL)]
+    if SPANISH_MIRROR_WEBHOOK_URL:
+        targets.append(("es", SPANISH_MIRROR_WEBHOOK_URL))
+    return targets
+
+
+async def _enqueue_job(action: str, message: discord.Message, webhook_url: str, target_lang: str,
+                        assets: list[dict], attempt: int = 1):
+    queue = mirror_queues.setdefault(target_lang, asyncio.Queue())
+    await queue.put((action, message, webhook_url, target_lang, assets, attempt))
+    size = queue.qsize()
+    if size >= _QUEUE_WARN_THRESHOLD:
+        log.warning(f"Mirror queue for '{target_lang}' backing up: {size} pending job(s)")
 
 
 async def enqueue_mirror(message: discord.Message):
-    await mirror_queue.put((message, MIRROR_WEBHOOK_URL, "en", 1))
-    if SPANISH_MIRROR_WEBHOOK_URL:
-        await mirror_queue.put((message, SPANISH_MIRROR_WEBHOOK_URL, "es", 1))
+    assets = await fetch_message_assets(message)
+    for lang, webhook_url in _mirror_targets():
+        await _enqueue_job("send", message, webhook_url, lang, assets)
 
 
-async def mirror_worker():
-    log.info("Mirror worker started")
+async def enqueue_mirror_edit(message: discord.Message):
+    assets = await fetch_message_assets(message)
+    for lang, webhook_url in _mirror_targets():
+        await _enqueue_job("edit", message, webhook_url, lang, assets)
+
+
+async def mirror_worker(target_lang: str, queue: asyncio.Queue):
+    log.info(f"Mirror worker started for target='{target_lang}'")
     while True:
-        message, webhook_url, target_lang, attempt = await mirror_queue.get()
+        action, message, webhook_url, lang, assets, attempt = await queue.get()
         try:
-            await mirror_message(message, webhook_url, target_lang)
+            if action == "edit":
+                await mirror_message_edit(message, webhook_url, lang, assets)
+            else:
+                await mirror_message(message, webhook_url, lang, assets)
         except discord.HTTPException as e:
-            if e.status == 429 and attempt < MIRROR_MAX_ATTEMPTS:
+            if e.status in (429, 500, 502, 503, 504) and attempt < MIRROR_MAX_ATTEMPTS:
                 delay = MIRROR_RETRY_BACKOFF * attempt
                 log.warning(
-                    f"Rate limited mirroring message {message.id} ({target_lang}), "
+                    f"HTTP {e.status} mirroring message {message.id} ({lang}, {action}), "
                     f"attempt {attempt}/{MIRROR_MAX_ATTEMPTS} — retrying in {delay:.0f}s"
                 )
                 await asyncio.sleep(delay)
-                await mirror_queue.put((message, webhook_url, target_lang, attempt + 1))
+                await _enqueue_job(action, message, webhook_url, lang, assets, attempt + 1)
             else:
                 log.error(
-                    f"Giving up mirroring message {message.id} ({target_lang}) "
+                    f"Giving up mirroring message {message.id} ({lang}, {action}) "
                     f"after {attempt} attempt(s): {e}"
                 )
         except Exception as e:
-            log.error(f"Failed to mirror message {message.id} ({target_lang}): {e}")
+            log.error(f"Failed to mirror message {message.id} ({lang}, {action}): {e}")
         finally:
-            mirror_queue.task_done()
+            queue.task_done()
             await asyncio.sleep(MIRROR_MIN_INTERVAL)
 
 
@@ -233,9 +449,34 @@ async def on_ready():
     await adopt_existing_subscription_if_any()
     if not reconcile_subscription.is_running():
         reconcile_subscription.start()
-    global _mirror_worker_task
-    if _mirror_worker_task is None or _mirror_worker_task.done():
-        _mirror_worker_task = asyncio.create_task(mirror_worker())
+
+    if not _mirror_worker_tasks:
+        for lang, _ in _mirror_targets():
+            queue = mirror_queues.setdefault(lang, asyncio.Queue())
+            _mirror_worker_tasks.append(asyncio.create_task(mirror_worker(lang, queue)))
+
+
+@bot.event
+async def on_disconnect():
+    # discord.py auto-reconnects on its own; this is just visibility so a
+    # peak-hour gateway hiccup shows up in the logs instead of looking like
+    # silence.
+    log.warning("Disconnected from Discord gateway (auto-reconnecting)")
+
+
+@bot.event
+async def on_resumed():
+    log.info("Discord gateway session resumed")
+
+
+@bot.event
+async def on_error(event_method: str, *args, **kwargs):
+    # Default discord.py behavior just prints a traceback; logging it
+    # properly means it actually shows up in Railway's log stream instead of
+    # possibly getting lost, and — critically — this keeps the bot itself
+    # running instead of an unhandled error in one event handler taking
+    # down the process.
+    log.exception(f"Unhandled exception in event handler '{event_method}'")
 
 
 async def adopt_existing_subscription_if_any():
@@ -307,6 +548,26 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # Previously there was no edit handler at all, so editing a message
+    # after it had already been mirrored left the mirrored copies showing
+    # the stale, pre-edit text forever.
+    if after.author.bot:
+        return
+    if after.channel.id != SOURCE_CHANNEL_ID:
+        return
+    if not state.get("active"):
+        return
+    if before.content == after.content:
+        # Discord also fires this event for edits that don't touch content
+        # (e.g. a link unfurling into an embed a moment after posting) —
+        # skip those so we're not re-translating and re-editing for no
+        # visible change.
+        return
+    await enqueue_mirror_edit(after)
+
+
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
@@ -315,6 +576,23 @@ def is_admin(interaction: discord.Interaction) -> bool:
         return True
     perms = getattr(interaction.user, "guild_permissions", None)
     return bool(perms and perms.administrator)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Without this, an unhandled error in any slash command (e.g. a Dodo API
+    # hiccup) just leaves the user's interaction hanging with "the
+    # application did not respond" and dies silently in the logs.
+    cmd_name = interaction.command.name if interaction.command else "?"
+    log.error(f"Slash command error in /{cmd_name}: {error}")
+    message = "Something went wrong running that command. Please try again in a moment."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 @bot.tree.command(name="subscribe", description="Get a payment link to activate translation")
@@ -507,9 +785,52 @@ async def start_webserver():
 
 
 async def main():
-    async with bot:
-        await start_webserver()
-        await bot.start(DISCORD_TOKEN)
+    global http_session
+    # limit / limit_per_host bound how many concurrent connections we open —
+    # generous enough for two mirror workers + Azure calls + attachment
+    # fetches running at once, without letting a runaway burst open
+    # unlimited sockets. The timeout means a hung request to Azure or
+    # Discord gets abandoned (and retried/logged) instead of hanging a
+    # worker forever.
+    connector = aiohttp.TCPConnector(limit=20, limit_per_host=10, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+    http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+    # Translate SIGTERM (what Railway sends on redeploy/stop) into a clean
+    # shutdown instead of an abrupt kill mid-write. SIGINT (Ctrl+C) covered
+    # too, for local runs.
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass  # not available on this platform — Ctrl+C still raises KeyboardInterrupt as before
+
+    try:
+        async with bot:
+            await start_webserver()
+            bot_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
+            stop_task = asyncio.create_task(stop_event.wait())
+            await asyncio.wait({bot_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+
+            if bot_task.done():
+                # The bot task ending on its own means a real failure (e.g.
+                # bad token, fatal gateway error) — surface it so the
+                # process exits non-zero and Railway restarts it, instead of
+                # looking like a clean shutdown.
+                exc = bot_task.exception()
+                if exc is not None:
+                    raise exc
+            else:
+                log.info("Shutdown signal received, closing up...")
+                await bot.close()
+    finally:
+        if reconcile_subscription.is_running():
+            reconcile_subscription.cancel()
+        for task in _mirror_worker_tasks:
+            task.cancel()
+        await http_session.close()
 
 
 if __name__ == "__main__":
