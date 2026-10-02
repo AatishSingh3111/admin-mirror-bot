@@ -73,6 +73,10 @@ payment.
    - `SPANISH_MIRROR_WEBHOOK_URL` (optional)
    - `GERMAN_MIRROR_WEBHOOK_URL` (optional)
    - `FRENCH_MIRROR_WEBHOOK_URL` (optional)
+   - `GERMAN_MIRROR_ENABLED` (optional — `true` to have German on by
+     default; off if unset)
+   - `FRENCH_MIRROR_ENABLED` (optional — `true` to have French on by
+     default; off if unset)
    - `GUILD_ID`
    - `ADMIN_USER_IDS` (optional, comma-separated Discord user IDs)
    - `DODO_PAYMENTS_API_KEY`
@@ -111,9 +115,17 @@ payment.
 - While inactive: the bot stays online and connected, but posts nothing to
   any mirror channel.
 - While active: every non-bot message in `#admin` is mirrored — translated
-  to English, and to Spanish, German and French too for each of those
-  webhooks that is configured — with the sender's name and avatar shown,
-  attachments included.
+  to English, and to Spanish too if that webhook is configured — with the
+  sender's name and avatar shown, attachments included.
+- German and French are add-on languages and are **off by default**, even
+  with their webhooks configured. Nothing is sent to those channels and no
+  translation characters are used for them while they are off. An admin
+  switches each one separately with `/language` (pick German or French,
+  then On or Off); `/language` on its own shows the current state.
+- A `/language` switch is saved in the local state file, so like the
+  subscription state it resets on a fresh deploy unless a Volume is
+  attached. To keep a language on permanently, set `GERMAN_MIRROR_ENABLED`
+  or `FRENCH_MIRROR_ENABLED` to `true` in the host's variables.
 - Subscription state is cached locally and updated instantly by Dodo's
   webhook. An hourly background check also re-syncs directly with Dodo's
   API, so a missed webhook can't leave the bot stuck in the wrong state for
