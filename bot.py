@@ -29,6 +29,27 @@ SPANISH_MIRROR_WEBHOOK_URL = os.environ.get("SPANISH_MIRROR_WEBHOOK_URL")
 GERMAN_MIRROR_WEBHOOK_URL = os.environ.get("GERMAN_MIRROR_WEBHOOK_URL")
 FRENCH_MIRROR_WEBHOOK_URL = os.environ.get("FRENCH_MIRROR_WEBHOOK_URL")
 
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# German and French are add-on languages, each with its own on/off switch.
+# They start OFF unless the matching *_ENABLED variable is set to "true".
+# An admin can also flip either one at runtime with /language.
+EXTRA_LANGUAGES: dict[str, dict] = {
+    "de": {
+        "name": "German",
+        "webhook": GERMAN_MIRROR_WEBHOOK_URL,
+        "default_on": _env_flag("GERMAN_MIRROR_ENABLED"),
+    },
+    "fr": {
+        "name": "French",
+        "webhook": FRENCH_MIRROR_WEBHOOK_URL,
+        "default_on": _env_flag("FRENCH_MIRROR_ENABLED"),
+    },
+}
+
 GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_USER_IDS = {
     int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()
@@ -90,6 +111,17 @@ def save_state(state: dict) -> None:
 
 
 state = load_state()
+
+
+def language_enabled(lang: str) -> bool:
+    # A /language switch (saved in state) wins over the *_ENABLED variable.
+    # State is wiped on a fresh deploy unless a Volume is attached, and the
+    # variable's value applies again from that point.
+    cfg = EXTRA_LANGUAGES[lang]
+    if not cfg["webhook"]:
+        return False
+    override = (state.get("languages") or {}).get(lang)
+    return cfg["default_on"] if override is None else bool(override)
 
 # ---------------------------------------------------------------------------
 # Discord bot
@@ -383,15 +415,26 @@ mirror_queues: dict[str, asyncio.Queue] = {}
 _mirror_worker_tasks: list[asyncio.Task] = []
 
 
-def _mirror_targets() -> list[tuple[str, str]]:
+def _configured_targets() -> list[tuple[str, str]]:
+    # Every language that has a webhook, whether or not it is switched on.
+    # Workers are started for all of these, so a language switched on later
+    # with /language starts flowing straight away with no restart.
     targets = [("en", MIRROR_WEBHOOK_URL)]
     if SPANISH_MIRROR_WEBHOOK_URL:
         targets.append(("es", SPANISH_MIRROR_WEBHOOK_URL))
-    if GERMAN_MIRROR_WEBHOOK_URL:
-        targets.append(("de", GERMAN_MIRROR_WEBHOOK_URL))
-    if FRENCH_MIRROR_WEBHOOK_URL:
-        targets.append(("fr", FRENCH_MIRROR_WEBHOOK_URL))
+    for lang, cfg in EXTRA_LANGUAGES.items():
+        if cfg["webhook"]:
+            targets.append((lang, cfg["webhook"]))
     return targets
+
+
+def _target_active(lang: str) -> bool:
+    return lang not in EXTRA_LANGUAGES or language_enabled(lang)
+
+
+def _mirror_targets() -> list[tuple[str, str]]:
+    # Only the languages that should receive messages right now.
+    return [(lang, url) for lang, url in _configured_targets() if _target_active(lang)]
 
 
 async def _enqueue_job(action: str, message: discord.Message, webhook_url: str, target_lang: str,
@@ -419,6 +462,11 @@ async def mirror_worker(target_lang: str, queue: asyncio.Queue):
     log.info(f"Mirror worker started for target='{target_lang}'")
     while True:
         action, message, webhook_url, lang, assets, attempt = await queue.get()
+        if not _target_active(lang):
+            # Switched off while this job was waiting: drop it so "off" takes
+            # effect immediately and no translation characters are spent.
+            queue.task_done()
+            continue
         try:
             if action == "edit":
                 await mirror_message_edit(message, webhook_url, lang, assets)
@@ -457,9 +505,13 @@ async def on_ready():
         reconcile_subscription.start()
 
     if not _mirror_worker_tasks:
-        for lang, _ in _mirror_targets():
+        for lang, _ in _configured_targets():
             queue = mirror_queues.setdefault(lang, asyncio.Queue())
             _mirror_worker_tasks.append(asyncio.create_task(mirror_worker(lang, queue)))
+
+    for lang, cfg in EXTRA_LANGUAGES.items():
+        if cfg["webhook"]:
+            log.info(f"Extra language '{lang}' ({cfg['name']}): {'ON' if language_enabled(lang) else 'OFF'}")
 
 
 @bot.event
@@ -690,6 +742,75 @@ async def cancel_subscription(interaction: discord.Interaction, when: app_comman
             "Something went wrong cancelling the subscription. Check the bot logs.",
             ephemeral=True,
         )
+
+
+def _language_status_text() -> str:
+    lines = []
+    for lang, cfg in EXTRA_LANGUAGES.items():
+        if not cfg["webhook"]:
+            status = "not set up (no webhook)"
+        elif language_enabled(lang):
+            status = "\u2705 **on**"
+        else:
+            status = "\u26d4 **off**"
+        lines.append(f"{cfg['name']}: {status}")
+    return "\n".join(lines)
+
+
+@bot.tree.command(name="language", description="Show or switch the German/French mirror channels (admins only)")
+@app_commands.describe(language="Which language to switch", switch="Turn it on or off")
+@app_commands.choices(
+    language=[
+        app_commands.Choice(name="German", value="de"),
+        app_commands.Choice(name="French", value="fr"),
+    ],
+    switch=[
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+    ],
+)
+async def language_switch(
+    interaction: discord.Interaction,
+    language: app_commands.Choice[str] = None,
+    switch: app_commands.Choice[str] = None,
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "Only a server admin can use this.", ephemeral=True
+        )
+        return
+
+    # No arguments (or only one): just report the current state.
+    if language is None or switch is None:
+        await interaction.response.send_message(
+            _language_status_text()
+            + "\n\nTo change one, run `/language` again and pick both a language and On/Off.",
+            ephemeral=True,
+        )
+        return
+
+    cfg = EXTRA_LANGUAGES[language.value]
+    if not cfg["webhook"]:
+        await interaction.response.send_message(
+            f"{cfg['name']} has no webhook configured, so it can't be switched on yet.",
+            ephemeral=True,
+        )
+        return
+
+    turn_on = switch.value == "on"
+    state.setdefault("languages", {})[language.value] = turn_on
+    save_state(state)
+    log.info(f"Extra language '{language.value}' switched {'ON' if turn_on else 'OFF'} by {interaction.user.id}")
+
+    note = ""
+    if turn_on and not state.get("active"):
+        note = "\n\nNote: the main subscription is inactive, so nothing is mirrored anywhere until it is active."
+    await interaction.response.send_message(
+        f"{cfg['name']} is now {'switched **on**' if turn_on else 'switched **off**'}.\n\n"
+        + _language_status_text()
+        + note,
+        ephemeral=True,
+    )
 
 
 # ---------------------------------------------------------------------------
