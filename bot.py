@@ -26,6 +26,8 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 SOURCE_CHANNEL_ID = int(os.environ["SOURCE_CHANNEL_ID"])
 MIRROR_WEBHOOK_URL = os.environ["MIRROR_WEBHOOK_URL"]
 SPANISH_MIRROR_WEBHOOK_URL = os.environ.get("SPANISH_MIRROR_WEBHOOK_URL")
+GERMAN_MIRROR_WEBHOOK_URL = os.environ.get("GERMAN_MIRROR_WEBHOOK_URL")
+FRENCH_MIRROR_WEBHOOK_URL = os.environ.get("FRENCH_MIRROR_WEBHOOK_URL")
 
 GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_USER_IDS = {
@@ -208,9 +210,9 @@ async def build_reply_line(message: discord.Message, target_lang: str) -> str | 
 
 async def fetch_message_assets(message: discord.Message) -> list[dict]:
     # Downloaded once per source message (not once per target language), so
-    # mirroring to English *and* Spanish doesn't pull every attachment off
-    # Discord's CDN twice — that duplicate traffic was unnecessary load on
-    # every image/video-heavy burst.
+    # mirroring to English, Spanish, German *and* French doesn't pull every
+    # attachment off Discord's CDN once per language — that duplicate traffic
+    # was unnecessary load on every image/video-heavy burst.
     snapshots = getattr(message, "message_snapshots", None) or []
     all_attachments = list(message.attachments) + [
         a for snapshot in snapshots for a in (getattr(snapshot, "attachments", None) or [])
@@ -232,7 +234,7 @@ async def fetch_message_assets(message: discord.Message) -> list[dict]:
 def build_files_from_assets(assets: list[dict]) -> list[discord.File]:
     # Builds a fresh discord.File per send from already-downloaded bytes —
     # discord.py consumes/closes a File object once it's sent, so the same
-    # File can't be reused across the EN and ES jobs, but the expensive
+    # File can't be reused across the per-language jobs, but the expensive
     # part (the network fetch) only happens once.
     files = []
     for asset in assets:
@@ -361,11 +363,11 @@ async def mirror_message_edit(message: discord.Message, webhook_url: str, target
 #
 #  - Attachments are downloaded once per source message (fetch_message_assets),
 #    not once per target language.
-#  - Each target language gets its OWN queue and its OWN worker, so English
-#    and Spanish mirroring proceed in parallel instead of taking turns on a
-#    single shared "one message per second" budget.
+#  - Each target language gets its OWN queue and its OWN worker, so English,
+#    Spanish, German and French mirroring proceed in parallel instead of
+#    taking turns on a single shared "one message per second" budget.
 #  - Each worker only sends to its own webhook, MIRROR_MIN_INTERVAL apart,
-#    which stays well under Discord's per-webhook rate limit even with both
+#    which stays well under Discord's per-webhook rate limit even with all
 #    workers running at once.
 #  - A genuine 429/5xx re-queues the job with backoff (up to
 #    MIRROR_MAX_ATTEMPTS) instead of dropping the message. A backlog past
@@ -385,6 +387,10 @@ def _mirror_targets() -> list[tuple[str, str]]:
     targets = [("en", MIRROR_WEBHOOK_URL)]
     if SPANISH_MIRROR_WEBHOOK_URL:
         targets.append(("es", SPANISH_MIRROR_WEBHOOK_URL))
+    if GERMAN_MIRROR_WEBHOOK_URL:
+        targets.append(("de", GERMAN_MIRROR_WEBHOOK_URL))
+    if FRENCH_MIRROR_WEBHOOK_URL:
+        targets.append(("fr", FRENCH_MIRROR_WEBHOOK_URL))
     return targets
 
 
@@ -787,7 +793,7 @@ async def start_webserver():
 async def main():
     global http_session
     # limit / limit_per_host bound how many concurrent connections we open —
-    # generous enough for two mirror workers + Azure calls + attachment
+    # generous enough for the mirror workers + Azure calls + attachment
     # fetches running at once, without letting a runaway burst open
     # unlimited sockets. The timeout means a hung request to Azure or
     # Discord gets abandoned (and retried/logged) instead of hanging a

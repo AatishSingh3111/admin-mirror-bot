@@ -1,10 +1,11 @@
 # Admin Mirror + Auto-Translate Bot (subscription-gated)
 
-This bot watches your `#admin` channel and mirrors messages into English and
-Spanish channels, translating as needed. **Translation only runs while a
-subscription is active** — the bot stays connected and live in your server
-either way, but it won't mirror anything into either channel until someone
-with admin rights runs `/subscribe` and completes payment.
+This bot watches your `#admin` channel and mirrors messages into English,
+Spanish, German and French channels, translating as needed. **Translation
+only runs while a subscription is active** — the bot stays connected and
+live in your server either way, but it won't mirror anything into any mirror
+channel until someone with admin rights runs `/subscribe` and completes
+payment.
 
 ## 1. Create the Discord bot application
 
@@ -28,7 +29,8 @@ with admin rights runs `/subscribe` and completes payment.
 ## 3. Set up the channels in Discord
 
 1. Create your English mirror channel (e.g. `#admin-en`) and, if you want
-   it, a Spanish one (e.g. `#admin-es`).
+   them, a Spanish one (e.g. `#admin-es`), a German one (e.g. `#admin-de`)
+   and a French one (e.g. `#admin-fr`).
 2. For each, create a webhook: **Channel Settings → Integrations →
    Webhooks → New Webhook → Copy Webhook URL**.
 3. Turn on Developer Mode: **User Settings → Advanced → Developer Mode**.
@@ -69,6 +71,8 @@ with admin rights runs `/subscribe` and completes payment.
    - `SOURCE_CHANNEL_ID`
    - `MIRROR_WEBHOOK_URL`
    - `SPANISH_MIRROR_WEBHOOK_URL` (optional)
+   - `GERMAN_MIRROR_WEBHOOK_URL` (optional)
+   - `FRENCH_MIRROR_WEBHOOK_URL` (optional)
    - `GUILD_ID`
    - `ADMIN_USER_IDS` (optional, comma-separated Discord user IDs)
    - `DODO_PAYMENTS_API_KEY`
@@ -105,10 +109,11 @@ with admin rights runs `/subscribe` and completes payment.
 ## How it behaves
 
 - While inactive: the bot stays online and connected, but posts nothing to
-  either mirror channel.
+  any mirror channel.
 - While active: every non-bot message in `#admin` is mirrored — translated
-  to English, and to Spanish too if that webhook is configured — with the
-  sender's name and avatar shown, attachments included.
+  to English, and to Spanish, German and French too for each of those
+  webhooks that is configured — with the sender's name and avatar shown,
+  attachments included.
 - Subscription state is cached locally and updated instantly by Dodo's
   webhook. An hourly background check also re-syncs directly with Dodo's
   API, so a missed webhook can't leave the bot stuck in the wrong state for
